@@ -2,14 +2,18 @@
 
 import asyncio
 from collections import deque
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
+import httpx
 from loguru import logger
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import QQConfig
+
+MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024  # 20MB
 
 try:
     import botpy
@@ -60,6 +64,7 @@ class QQChannel(BaseChannel):
         super().__init__(config, bus)
         self.config: QQConfig = config
         self._client: "botpy.Client | None" = None
+        self._http: httpx.AsyncClient | None = None
         self._processed_ids: deque = deque(maxlen=1000)
         self._msg_seq: int = 1  # 消息序列号，避免被 QQ API 去重
         self._chat_type_cache: dict[str, str] = {}
@@ -75,6 +80,7 @@ class QQChannel(BaseChannel):
             return
 
         self._running = True
+        self._http = httpx.AsyncClient(timeout=30.0)
         BotClass = _make_bot_class(self)
         self._client = BotClass()
         logger.info("QQ bot started (C2C & Group supported)")
@@ -94,6 +100,12 @@ class QQChannel(BaseChannel):
     async def stop(self) -> None:
         """Stop the QQ bot."""
         self._running = False
+        if self._http:
+            try:
+                await self._http.aclose()
+            except Exception:
+                pass
+            self._http = None
         if self._client:
             try:
                 await self._client.close()
@@ -139,7 +151,9 @@ class QQChannel(BaseChannel):
             self._processed_ids.append(data.id)
 
             content = (data.content or "").strip()
-            if not content:
+            attachments = getattr(data, "attachments", None) or []
+
+            if not content and not attachments:
                 return
 
             if is_group:
