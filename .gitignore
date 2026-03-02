@@ -2,10 +2,12 @@
 .assets
 .docs
 .env
+.cursor/
 *.pyc
 dist/
 build/
 docs/
+third_party/
 *.egg-info/
 *.egg
 *.pycs
@@ -21,5 +23,7 @@ __pycache__/
 poetry.lock
 .pytest_cache/
 botpy.log
+botpy.log.*
+tests/
+third_party/
 nano.*.save
-
