@@ -23,3 +23,12 @@ The skill format and metadata structure follow OpenClaw's conventions to maintai
 | `tmux` | Remote-control tmux sessions |
 | `clawhub` | Search and install skills from ClawHub registry |
 | `skill-creator` | Create new skills |
+| `file_reader` | Read and summarize text-based files only (migrated from CoPaw) |
+| `news` | Look up latest news from specified news sites (migrated from CoPaw) |
+| `browser_visible` | Use visible (headed) browser when user requests it (migrated from CoPaw) |
+| `xlsx` | Spreadsheet .xlsx/.csv/.tsv create, read, edit (migrated from CoPaw) |
+| `pptx` | PPT create, edit, parse (migrated from CoPaw) |
+| `pdf` | PDF read, merge, split, forms, OCR (migrated from CoPaw) |
+| `docx` | Word document create, read, edit (migrated from CoPaw) |
+
+See [MIGRATION_VERIFY.md](MIGRATION_VERIFY.md) for verification samples for migrated CoPaw skills and tools.

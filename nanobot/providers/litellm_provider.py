@@ -4,6 +4,7 @@ import hashlib
 import os
 import secrets
 import string
+from collections.abc import AsyncIterator
 from typing import Any
 
 import json_repair
@@ -351,3 +352,93 @@ class LiteLLMProvider(LLMProvider):
     def get_default_model(self) -> str:
         """Get the default model."""
         return self.default_model
+
+    def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ) -> AsyncIterator[dict[str, Any]] | None:
+        """Stream chat completion: yield text_delta/reasoning_delta then done with LLMResponse."""
+        return self._chat_stream_impl(
+            messages=messages,
+            tools=tools,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+    async def _chat_stream_impl(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ) -> AsyncIterator[dict[str, Any]]:
+        original_model = model or self.default_model
+        model = self._resolve_model(original_model)
+        if self._supports_cache_control(original_model):
+            messages, tools = self._apply_cache_control(messages, tools)
+        max_tokens = max(1, max_tokens)
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": self._sanitize_messages(self._sanitize_empty_content(messages)),
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True,
+        }
+        self._apply_model_overrides(model, kwargs)
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
+        if self.extra_headers:
+            kwargs["extra_headers"] = self.extra_headers
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        try:
+            stream = await acompletion(**kwargs)
+        except Exception as e:
+            yield {"type": "done", "response": LLMResponse(content=f"Error: {e}", finish_reason="error")}
+            return
+        chunks: list[Any] = []
+        async for chunk in stream:
+            if not chunk or not getattr(chunk, "choices", None):
+                continue
+            choice = chunk.choices[0] if chunk.choices else None
+            if not choice or not getattr(choice, "delta", None):
+                continue
+            delta = choice.delta
+            chunks.append(chunk)
+            if getattr(delta, "content", None):
+                yield {"type": "text_delta", "content": delta.content}
+            reasoning = getattr(delta, "reasoning_content", None) or getattr(
+                delta, "reasoning", None
+            )
+            if reasoning:
+                yield {"type": "reasoning_delta", "content": reasoning}
+        try:
+            builder = getattr(litellm, "stream_chunk_builder", None)
+            if builder and chunks:
+                built = builder(chunks, messages=messages)
+                if built:
+                    response = self._parse_response(built)
+                    yield {"type": "done", "response": response}
+                    return
+        except Exception:
+            pass
+        content_parts: list[str] = []
+        for c in chunks:
+            if getattr(c, "choices", None) and c.choices:
+                d = getattr(c.choices[0], "delta", None)
+                if d and getattr(d, "content", None):
+                    content_parts.append(d.content)
+        response = LLMResponse(
+            content="".join(content_parts) if content_parts else None,
+            finish_reason="stop",
+        )
+        yield {"type": "done", "response": response}

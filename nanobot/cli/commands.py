@@ -1,30 +1,26 @@
 """CLI commands for nanobot."""
 
 import asyncio
+import getpass
 import os
+import random
 import select
 import signal
+import string
 import sys
+import threading
+import time
+from datetime import datetime
 from pathlib import Path
 
-# Force UTF-8 encoding for Windows console
-if sys.platform == "win32":
-    if sys.stdout.encoding != "utf-8":
-        os.environ["PYTHONIOENCODING"] = "utf-8"
-        # Re-open stdout/stderr with UTF-8 encoding
-        try:
-            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-        except Exception:
-            pass
-
 import typer
-from prompt_toolkit import print_formatted_text
-from prompt_toolkit import PromptSession
+from prompt_toolkit import print_formatted_text, PromptSession
+from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.formatted_text import ANSI, HTML
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.patch_stdout import patch_stdout
-from prompt_toolkit.application import run_in_terminal
+from prompt_toolkit.shortcuts import choice
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
@@ -34,6 +30,16 @@ from nanobot import __logo__, __version__
 from nanobot.config.paths import get_workspace_path
 from nanobot.config.schema import Config
 from nanobot.utils.helpers import sync_workspace_templates
+
+# Force UTF-8 encoding for Windows console
+if sys.platform == "win32":
+    if sys.stdout.encoding != "utf-8":
+        os.environ["PYTHONIOENCODING"] = "utf-8"
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+            sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 app = typer.Typer(
     name="nanobot",
@@ -129,14 +135,15 @@ def _render_interactive_ansi(render_fn) -> str:
     return capture.get()
 
 
-def _print_agent_response(response: str, render_markdown: bool) -> None:
-    """Render assistant response with consistent terminal styling."""
+def _print_agent_response(response: str, render_markdown: bool, streamed_already: bool = False) -> None:
+    """Render assistant response. When streamed_already, only print a newline (no duplicate body)."""
     console = _make_console()
-    content = response or ""
-    body = Markdown(content) if render_markdown else Text(content)
-    console.print()
-    console.print(f"[cyan]{__logo__} nanobot[/cyan]")
-    console.print(body)
+    if not streamed_already:
+        content = response or ""
+        body = Markdown(content) if render_markdown else Text(content)
+        console.print()
+        console.print(f"[cyan]{__logo__} nanobot[/cyan]")
+        console.print(body)
     console.print()
 
 
@@ -168,12 +175,72 @@ async def _print_interactive_response(response: str, render_markdown: bool) -> N
     await run_in_terminal(_write)
 
 
+# OpenCode-style tool summary: icon + title (inline) or icon + title + output (block)
+_TOOL_ICONS: dict[str, str] = {
+    "read_file": "→",
+    "write_file": "←",
+    "edit_file": "←",
+    "list_dir": "→",
+    "exec": "$",
+    "web_search": "◈",
+    "web_fetch": "%",
+    "message": "→",
+    "spawn": "•",
+    "task": "✓",
+    "todowrite": "#",
+    "todoread": "#",
+}
+_TOOL_BLOCK_DISPLAY: set[str] = {"exec", "write_file", "edit_file", "todowrite"}  # show output in block
+
+
+def _print_reasoning(content: str) -> None:
+    """Render model reasoning (thinking) block, OpenCode --thinking style."""
+    if not content or not content.strip():
+        return
+    console.print()
+    console.print(f"  [dim italic]Thinking: {content.strip()}[/dim italic]")
+    console.print()
+
+
+def _print_tool_summary(meta: dict, content: str, *, channels_config=None) -> None:
+    """Render one tool_summary outbound (OpenCode-style inline or block)."""
+    if meta.get("type") != "tool_summary":
+        return
+    tool_name = meta.get("tool_name") or ""
+    status = meta.get("status") or "completed"
+    title = meta.get("title") or tool_name.replace("_", " ").title()
+    description = meta.get("description")
+    output = meta.get("output") or content
+    if channels_config and not getattr(channels_config, "send_tool_hints", True):
+        return
+    # 每个工具只显示一行：仅在有结果时打印，跳过 "running"，避免与 "completed" 重复
+    if status == "running":
+        return
+    icon = _TOOL_ICONS.get(tool_name, "⚙")
+    if status == "error":
+        icon = "✗"
+    suffix = f" [dim]{description}[/dim]" if description else ""
+    console.print(f"  {icon} [dim]{title}[/dim]{suffix}")
+    if status == "completed" and tool_name in _TOOL_BLOCK_DISPLAY and output and output.strip():
+        for line in output.strip().splitlines()[:30]:
+            console.print(f"    [dim]{line}[/dim]")
+        if output.strip().count("\n") >= 30:
+            console.print("    [dim]...[/dim]")
+
+
+def _run_spinner_until(stop_event: threading.Event) -> None:
+    """Run a status spinner until stop_event is set."""
+    with console.status("[dim]nanobot is thinking...[/dim]", spinner="dots"):
+        while not stop_event.wait(timeout=0.15):
+            pass
+
+
 def _is_exit_command(command: str) -> bool:
     """Return True when input should end interactive chat."""
     return command.lower() in EXIT_COMMANDS
 
 
-async def _read_interactive_input_async() -> str:
+async def _read_interactive_input_async(prompt_html: str | None = None) -> str:
     """Read user input using prompt_toolkit (handles paste, history, display).
 
     prompt_toolkit natively handles:
@@ -183,14 +250,104 @@ async def _read_interactive_input_async() -> str:
     """
     if _PROMPT_SESSION is None:
         raise RuntimeError("Call _init_prompt_session() first")
+    if prompt_html is None:
+        prompt_html = "<b fg='ansiblue'>You:</b> "
     try:
         with patch_stdout():
-            return await _PROMPT_SESSION.prompt_async(
-                HTML("<b fg='ansiblue'>You:</b> "),
-            )
+            return await _PROMPT_SESSION.prompt_async(HTML(prompt_html))
     except EOFError as exc:
         raise KeyboardInterrupt from exc
 
+
+def _print_session_switch(agent_loop, key: str, recent_n: int = 6) -> None:
+    """Backward-compatible wrapper (kept for older call sites)."""
+    _ = recent_n
+    _render_session_transcript(agent_loop, key, render_markdown=True)
+
+
+def _render_session_transcript(
+    agent_loop,
+    key: str,
+    *,
+    render_markdown: bool,
+    max_messages: int = 60,
+) -> None:
+    """
+    Clear the screen and render a session transcript (user+assistant),
+    so switching feels like resuming at the last breakpoint (OpenCode-style).
+    """
+    session = agent_loop.sessions.get_or_create(key)
+    title = session.metadata.get("title") or key
+
+    console.clear()
+    console.print(f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
+    console.print(f"[dim]Session:[/dim] [cyan]{key}[/cyan]  [dim]{title}[/dim]\n")
+
+    msgs = [m for m in session.messages if (m.get("role") in {"user", "assistant"})]
+    if max_messages and len(msgs) > max_messages:
+        msgs = msgs[-max_messages:]
+
+    for m in msgs:
+        role = m.get("role")
+        raw = m.get("content")
+        if role == "user":
+            if isinstance(raw, str):
+                content = raw
+            elif isinstance(raw, list):
+                parts: list[str] = []
+                for p in raw:
+                    if isinstance(p, dict) and p.get("type") == "text":
+                        t = (p.get("text") or "").strip()
+                        if t:
+                            parts.append(t)
+                    elif isinstance(p, dict) and p.get("type") == "image_url":
+                        parts.append("[image]")
+                content = " ".join(parts).strip() or "[multimodal]"
+            else:
+                content = ""
+            console.print(f"[bold ansiblue]You:[/bold ansiblue] {content}")
+        elif role == "assistant":
+            _print_agent_response(raw if isinstance(raw, str) else "", render_markdown=render_markdown)
+
+
+def _pick_session_interactive(
+    rows: list[dict],
+    current_key: str,
+) -> str | None:
+    """Show a ↑/↓ selectable list of sessions; returns selected session key or None if cancelled."""
+    if not rows:
+        return None
+    options = []
+    default = None
+    for s in rows:
+        key = s.get("key", "")
+        title = s.get("title") or key
+        updated = (s.get("updated_at") or "")[:16]
+        label = f"{key} — {title}"
+        if updated:
+            label += f"  ({updated})"
+        options.append((key, label))
+        if key == current_key:
+            default = key
+    if default is None and options:
+        default = options[0][0]
+    kb = KeyBindings()
+
+    @kb.add("escape")
+    def _cancel(event):
+        event.app.exit(exception=KeyboardInterrupt())
+
+    try:
+        with patch_stdout():
+            return choice(
+                message=HTML("<b>Select session</b>:"),
+                options=options,
+                default=default,
+                bottom_toolbar=HTML(" <b>↑</b>/<b>↓</b> select  <b>Enter</b> confirm  <b>Esc</b> cancel"),
+                key_bindings=kb,
+            )
+    except (KeyboardInterrupt, EOFError):
+        return None
 
 
 def version_callback(value: bool):
@@ -309,6 +466,51 @@ def _make_provider(config: Config):
             provider_name=provider_name,
         )
 
+
+def _resolve_login_workspace(config: Config, workspace_arg: str) -> tuple[Path, Path]:
+    """
+    If allowed_users file exists: prompt user_id/password, validate, ensure_user_workspace;
+    for admin, apply workspace_arg (global | user_id). Returns (workspace_path, cron_store_path).
+    Otherwise returns (config.workspace_path, get_data_dir()/cron/jobs.json).
+    """
+    from nanobot.config.loader import get_data_dir
+    from nanobot.auth import allowed_users_path, validate_user, ensure_user_workspace, get_user_root
+
+    auth_path = allowed_users_path(config.auth.allowed_users_path or None)
+    if not auth_path.exists():
+        return config.workspace_path, get_data_dir() / "cron" / "jobs.json"
+
+    user_id = input("user_id: ").strip()
+    if not user_id:
+        console.print("[red]user_id is required[/red]")
+        raise typer.Exit(1)
+    password = getpass.getpass("password: ")
+    ok, is_admin = validate_user(user_id, password, auth_path)
+    if not ok:
+        console.print("[red]Invalid user_id or password[/red]")
+        raise typer.Exit(1)
+    ensure_user_workspace(user_id)
+    # Admin: --workspace global => global root; default => current user's workspace; --workspace <user_id> => that user's dir
+    if is_admin and workspace_arg and workspace_arg.strip().lower() != "global":
+        target_id = workspace_arg.strip()
+        root = get_user_root(target_id)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "cron").mkdir(exist_ok=True)
+        (root / "history").mkdir(exist_ok=True)
+        (root / "media").mkdir(exist_ok=True)
+        (root / "workspace").mkdir(exist_ok=True)
+        from nanobot.utils.helpers import sync_workspace_templates
+        sync_workspace_templates(root / "workspace", silent=True)
+        return root / "workspace", root / "cron" / "jobs.json"
+    if is_admin:
+        # Admin with --workspace global: use global; otherwise default to logged-in user's workspace so "login as 111" uses 111's dir
+        if workspace_arg and str(workspace_arg).strip().lower() == "global":
+            return config.workspace_path, get_data_dir() / "cron" / "jobs.json"
+        root = get_user_root(user_id)
+        return root / "workspace", root / "cron" / "jobs.json"
+    root = get_user_root(user_id)
+    return root / "workspace", root / "cron" / "jobs.json"
+
     defaults = config.agents.defaults
     provider.generation = GenerationSettings(
         temperature=defaults.temperature,
@@ -372,7 +574,6 @@ def gateway(
     if verbose:
         import logging
         logging.basicConfig(level=logging.DEBUG)
-
     config = _load_runtime_config(config, workspace)
     _print_deprecated_memory_window_notice(config)
     port = port if port is not None else config.gateway.port
@@ -382,16 +583,16 @@ def gateway(
     bus = MessageBus()
     provider = _make_provider(config)
     session_manager = SessionManager(config.workspace_path)
-
+    
     # Create cron service first (callback set after agent creation)
-    cron_store_path = get_cron_dir() / "jobs.json"
+    cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
     # Create agent with cron service
     agent = AgentLoop(
         bus=bus,
         provider=provider,
-        workspace=config.workspace_path,
+        workspace=workspace_path,
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         context_window_tokens=config.agents.defaults.context_window_tokens,
@@ -437,12 +638,31 @@ def gateway(
             return response
 
         if job.payload.deliver and job.payload.to and response:
-            from nanobot.bus.events import OutboundMessage
-            await bus.publish_outbound(OutboundMessage(
-                channel=job.payload.channel or "cli",
-                chat_id=job.payload.to,
-                content=response
-            ))
+            if job.payload.channel == "dashboard" and config.gateway.dashboard_url:
+                # Push to dashboard so the web UI can show the notification
+                to = job.payload.to
+                if ":" in to:
+                    uid, sid = to.split(":", 1)
+                else:
+                    uid, sid = to, ""
+                try:
+                    import httpx
+                    async with httpx.AsyncClient() as client:
+                        await client.post(
+                            f"{config.gateway.dashboard_url.rstrip('/')}/api/notify",
+                            json={"user_id": uid, "session_id": sid, "content": response or ""},
+                            timeout=10.0,
+                        )
+                except Exception as e:
+                    from loguru import logger
+                    logger.warning("Failed to push cron notification to dashboard: {}", e)
+            else:
+                from nanobot.bus.events import OutboundMessage
+                await bus.publish_outbound(OutboundMessage(
+                    channel=job.payload.channel or "cli",
+                    chat_id=job.payload.to,
+                    content=response
+                ))
         return response
     cron.on_job = on_cron_job
 
@@ -491,7 +711,7 @@ def gateway(
 
     hb_cfg = config.gateway.heartbeat
     heartbeat = HeartbeatService(
-        workspace=config.workspace_path,
+        workspace=workspace_path,
         provider=provider,
         model=agent.model,
         on_execute=on_heartbeat_execute,
@@ -531,6 +751,59 @@ def gateway(
     asyncio.run(run())
 
 
+def _get_lan_ip() -> str | None:
+    """Best-effort local LAN IP for display (e.g. when binding 0.0.0.0)."""
+    try:
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.settimeout(0)
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+    except Exception:
+        return None
+
+
+@app.command()
+def dashboard(
+    host: str = typer.Option("0.0.0.0", "--host", "-h", help="Bind host"),
+    port: int = typer.Option(18791, "--port", "-p", help="Dashboard port"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+    with_gateway: bool = typer.Option(False, "--with-gateway", "-g", help="Also run gateway services (cron) in this process so reminders notify in the web UI without a separate gateway"),
+):
+    """Start the nanobot web dashboard (login, chat, sessions)."""
+    from nanobot.config.loader import load_config
+    from nanobot.auth import allowed_users_path
+    from nanobot.dashboard import create_app
+    import uvicorn
+
+    if verbose:
+        import logging
+        logging.basicConfig(level=logging.DEBUG)
+
+    config = load_config()
+    auth_path = allowed_users_path(config.auth.allowed_users_path or None)
+    if not auth_path.exists():
+        console.print("[red]Dashboard requires allowed_users file.[/red]")
+        console.print(f"Create {auth_path} with lines: user_id:password")
+        raise typer.Exit(1)
+
+    app = create_app(
+        auth_path=auth_path,
+        config_allowed_users_path=config.auth.allowed_users_path or None,
+        with_gateway=with_gateway,
+    )
+    console.print(f"{__logo__} Dashboard at http://localhost:{port}")
+    if host == "0.0.0.0":
+        _lan_ip = _get_lan_ip()
+        if _lan_ip:
+            console.print(f"[dim]Access via IP: http://{_lan_ip}:{port}[/dim]")
+    else:
+        console.print(f"[dim]Bound to http://{host}:{port}[/dim]")
+    if with_gateway:
+        console.print("[dim]Gateway (cron) enabled: reminders will run and notify in the web UI[/dim]")
+    if host == "0.0.0.0":
+        console.print("[dim]If access via IP fails, allow port in firewall (e.g. Linux: ufw allow 8792)[/dim]")
+    uvicorn.run(app, host=host, port=port, log_level="debug" if verbose else "info")
 
 
 # ============================================================================
@@ -542,10 +815,11 @@ def gateway(
 def agent(
     message: str = typer.Option(None, "--message", "-m", help="Message to send to the agent"),
     session_id: str = typer.Option("cli:direct", "--session", "-s", help="Session ID"),
-    workspace: str | None = typer.Option(None, "--workspace", "-w", help="Workspace directory"),
     config: str | None = typer.Option(None, "--config", "-c", help="Config file path"),
     markdown: bool = typer.Option(True, "--markdown/--no-markdown", help="Render assistant output as Markdown"),
+    thinking: bool = typer.Option(False, "--thinking/--no-thinking", help="Show model reasoning (thinking) blocks when available"),
     logs: bool = typer.Option(False, "--logs/--no-logs", help="Show nanobot runtime logs during chat"),
+    workspace: str = typer.Option("", "--workspace", "-w", help="Admin only: use 'global' for global workspace; default is current user's; or user_id to run as"),
 ):
     """Interact with the agent directly."""
     from loguru import logger
@@ -557,13 +831,14 @@ def agent(
 
     config = _load_runtime_config(config, workspace)
     _print_deprecated_memory_window_notice(config)
-    sync_workspace_templates(config.workspace_path)
+    workspace_path, cron_store_path = _resolve_login_workspace(config, workspace)
+    sync_workspace_templates(workspace_path)
 
     bus = MessageBus()
     provider = _make_provider(config)
 
     # Create cron service for tool usage (no callback needed for CLI unless running)
-    cron_store_path = get_cron_dir() / "jobs.json"
+    cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
     if logs:
@@ -574,7 +849,7 @@ def agent(
     agent_loop = AgentLoop(
         bus=bus,
         provider=provider,
-        workspace=config.workspace_path,
+        workspace=workspace_path,
         model=config.agents.defaults.model,
         max_iterations=config.agents.defaults.max_tool_iterations,
         context_window_tokens=config.agents.defaults.context_window_tokens,
@@ -586,7 +861,7 @@ def agent(
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
     )
-
+    
     # Show spinner when logs are off (no output to miss); skip when logs are on
     def _thinking_ctx():
         if logs:
@@ -604,11 +879,71 @@ def agent(
         console.print(f"  [dim]↳ {content}[/dim]")
 
     if message:
-        # Single message mode — direct call, no bus needed
+        # Single message mode — run consumer to show tool_summary/progress while process_direct runs
         async def run_once():
-            with _thinking_ctx():
-                response = await agent_loop.process_direct(message, session_id, on_progress=_cli_progress)
-            _print_agent_response(response, render_markdown=markdown)
+            stream_delta_received = False
+            stop_spinner = threading.Event()
+            spinner_done = threading.Event()
+
+            def _spinner_thread_fn() -> None:
+                _run_spinner_until(stop_spinner)
+                spinner_done.set()
+
+            async def _drain_outbound():
+                nonlocal stream_delta_received
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(bus.consume_outbound(), timeout=0.3)
+                        if msg.metadata.get("type") == "text_delta":
+                            if not stream_delta_received:
+                                stream_delta_received = True
+                                stop_spinner.set()
+                                await asyncio.sleep(0.25)
+                            if msg.content:
+                                console.print(msg.content, end="")
+                        elif msg.metadata.get("type") == "reasoning_delta":
+                            if not stream_delta_received:
+                                stream_delta_received = True
+                                stop_spinner.set()
+                                await asyncio.sleep(0.25)
+                            if msg.content:
+                                console.print(f"[dim italic]{msg.content}[/dim italic]", end="")
+                        elif msg.metadata.get("type") == "reasoning" and thinking:
+                            _print_reasoning(msg.content)
+                        elif msg.metadata.get("type") == "tool_summary":
+                            _print_tool_summary(
+                                msg.metadata, msg.content,
+                                channels_config=None,  # CLI 始终展示工具调用，不受 send_tool_hints 影响
+                            )
+                        elif msg.metadata.get("_progress"):
+                            _cli_progress(msg.content, tool_hint=msg.metadata.get("_tool_hint", False))
+                    except asyncio.TimeoutError:
+                        continue
+                    except asyncio.CancelledError:
+                        break
+
+            drain_task = asyncio.create_task(_drain_outbound())
+            spinner_th: threading.Thread | None = None
+            if not logs:
+                spinner_th = threading.Thread(target=_spinner_thread_fn, daemon=True)
+                spinner_th.start()
+            try:
+                response = await agent_loop.process_direct(
+                    message, session_id, on_progress=_cli_progress
+                )
+            finally:
+                stop_spinner.set()
+                if spinner_th is not None:
+                    spinner_done.wait(timeout=0.5)
+                    spinner_th.join(timeout=0.3)
+                drain_task.cancel()
+                try:
+                    await drain_task
+                except asyncio.CancelledError:
+                    pass
+            if stream_delta_received:
+                console.print()
+            _print_agent_response(response or "", render_markdown=markdown, streamed_already=stream_delta_received)
             await agent_loop.close_mcp()
 
         asyncio.run(run_once())
@@ -616,12 +951,17 @@ def agent(
         # Interactive mode — route through bus like other channels
         from nanobot.bus.events import InboundMessage
         _init_prompt_session()
-        console.print(f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
 
         if ":" in session_id:
             cli_channel, cli_chat_id = session_id.split(":", 1)
         else:
             cli_channel, cli_chat_id = "cli", session_id
+        current_session: list[str] = [cli_channel, cli_chat_id]
+        initial_key = f"{current_session[0]}:{current_session[1]}"
+        if initial_key == "cli:new":
+            console.print(f"{__logo__} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n")
+        else:
+            _render_session_transcript(agent_loop, initial_key, render_markdown=markdown)
 
         def _handle_signal(signum, frame):
             sig_name = signal.Signals(signum).name
@@ -645,11 +985,37 @@ def agent(
             turn_done.set()
             turn_response: list[str] = []
 
+            received_stream_delta: list[bool] = [False]
+            stop_spinner_ref: list[threading.Event] = [threading.Event()]
+
             async def _consume_outbound():
                 while True:
                     try:
                         msg = await asyncio.wait_for(bus.consume_outbound(), timeout=1.0)
-                        if msg.metadata.get("_progress"):
+                        if msg.metadata.get("type") == "text_delta":
+                            if not received_stream_delta[0]:
+                                received_stream_delta[0] = True
+                                stop_spinner_ref[0].set()
+                                await asyncio.sleep(0.25)
+                            if msg.content:
+                                console.print(msg.content, end="")
+                        elif msg.metadata.get("type") == "reasoning_delta":
+                            if not received_stream_delta[0]:
+                                received_stream_delta[0] = True
+                                stop_spinner_ref[0].set()
+                                await asyncio.sleep(0.25)
+                            if msg.content:
+                                console.print(f"[dim italic]{msg.content}[/dim italic]", end="")
+                        elif msg.metadata.get("type") == "reasoning" and thinking:
+                            _print_reasoning(msg.content)
+                            continue
+                        elif msg.metadata.get("type") == "tool_summary":
+                            _print_tool_summary(
+                                msg.metadata, msg.content,
+                                channels_config=None,  # CLI 始终展示工具调用，不受 send_tool_hints 影响
+                            )
+                            continue
+                        elif msg.metadata.get("_progress"):
                             is_tool_hint = msg.metadata.get("_tool_hint", False)
                             ch = agent_loop.channels_config
                             if ch and is_tool_hint and not ch.send_tool_hints:
@@ -657,12 +1023,13 @@ def agent(
                             elif ch and not is_tool_hint and not ch.send_progress:
                                 pass
                             else:
-                                await _print_interactive_line(msg.content)
-
+                                console.print(f"  [dim]↳ {msg.content}[/dim]")
                         elif not turn_done.is_set():
                             if msg.content:
                                 turn_response.append(msg.content)
                             turn_done.set()
+                            if received_stream_delta[0]:
+                                console.print()
                         elif msg.content:
                             await _print_interactive_response(msg.content, render_markdown=markdown)
 
@@ -673,11 +1040,22 @@ def agent(
 
             outbound_task = asyncio.create_task(_consume_outbound())
 
+            def _session_title() -> str:
+                key = f"{current_session[0]}:{current_session[1]}"
+                if key == "cli:new":
+                    return "New session"
+                for s in agent_loop.sessions.list_sessions():
+                    if s.get("key") == key:
+                        return (s.get("title") or key)[:40]
+                return key[:40]
+
             try:
                 while True:
                     try:
                         _flush_pending_tty_input()
-                        user_input = await _read_interactive_input_async()
+                        title = _session_title()
+                        prompt_html = f"<b fg='ansicyan'>[{title}]</b> <b fg='ansiblue'>You:</b> "
+                        user_input = await _read_interactive_input_async(prompt_html)
                         command = user_input.strip()
                         if not command:
                             continue
@@ -687,21 +1065,77 @@ def agent(
                             console.print("\nGoodbye!")
                             break
 
+                        if command == "/session" or command.startswith("/session "):
+                            arg = command[8:].strip() if command.startswith("/session ") else ""
+                            rows = agent_loop.sessions.list_sessions()
+                            if not rows:
+                                console.print("[yellow]No sessions yet.[/yellow]")
+                                continue
+                            current_key = f"{current_session[0]}:{current_session[1]}"
+                            if arg:
+                                chosen = None
+                                if arg.isdigit():
+                                    idx = int(arg)
+                                    if 1 <= idx <= len(rows):
+                                        chosen = rows[idx - 1].get("key")
+                                else:
+                                    for s in rows:
+                                        if s.get("key") == arg:
+                                            chosen = arg
+                                            break
+                            else:
+                                chosen = await asyncio.to_thread(_pick_session_interactive, rows, current_key)
+                            if chosen and ":" in chosen:
+                                current_session[0], current_session[1] = chosen.split(":", 1)
+                                _render_session_transcript(agent_loop, chosen, render_markdown=markdown)
+                            elif chosen:
+                                current_session[0], current_session[1] = "cli", chosen
+                                _render_session_transcript(agent_loop, f"cli:{chosen}", render_markdown=markdown)
+                            elif arg and not chosen:
+                                console.print("[red]Session not found.[/red]")
+                            continue
+
                         turn_done.clear()
                         turn_response.clear()
+                        received_stream_delta[0] = False
+                        stop_spinner_ref[0] = threading.Event()
+                        spinner_done = threading.Event()
+
+                        # On first user message while on "new" session, create a real session (new key + new file)
+                        current_key = f"{current_session[0]}:{current_session[1]}"
+                        if current_key == "cli:new":
+                            new_id = datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
+                            current_session[0], current_session[1] = "cli", new_id
+
+                        def _spinner_thread_fn() -> None:
+                            _run_spinner_until(stop_spinner_ref[0])
+                            spinner_done.set()
 
                         await bus.publish_inbound(InboundMessage(
-                            channel=cli_channel,
+                            channel=current_session[0],
                             sender_id="user",
-                            chat_id=cli_chat_id,
+                            chat_id=current_session[1],
                             content=user_input,
                         ))
 
-                        with _thinking_ctx():
+                        spinner_th: threading.Thread | None = None
+                        if not logs:
+                            spinner_th = threading.Thread(target=_spinner_thread_fn, daemon=True)
+                            spinner_th.start()
+                        try:
                             await turn_done.wait()
+                        finally:
+                            stop_spinner_ref[0].set()
+                            if spinner_th is not None:
+                                spinner_done.wait(timeout=0.5)
+                                spinner_th.join(timeout=0.3)
 
-                        if turn_response:
-                            _print_agent_response(turn_response[0], render_markdown=markdown)
+                        if turn_response or received_stream_delta[0]:
+                            _print_agent_response(
+                                turn_response[0] if turn_response else "",
+                                render_markdown=markdown,
+                                streamed_already=received_stream_delta[0],
+                            )
                     except KeyboardInterrupt:
                         _restore_terminal()
                         console.print("\nGoodbye!")
@@ -841,6 +1275,218 @@ def channels_login():
         console.print(f"[red]Bridge failed: {e}[/red]")
     except FileNotFoundError:
         console.print("[red]npm not found. Please install Node.js.[/red]")
+
+
+# ============================================================================
+# Cron Commands
+# ============================================================================
+
+cron_app = typer.Typer(help="Manage scheduled tasks")
+app.add_typer(cron_app, name="cron")
+
+
+@cron_app.command("list")
+def cron_list(
+    all: bool = typer.Option(False, "--all", "-a", help="Include disabled jobs"),
+):
+    """List scheduled jobs."""
+    from nanobot.config.loader import get_data_dir
+    from nanobot.cron.service import CronService
+    
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+    
+    jobs = service.list_jobs(include_disabled=all)
+    
+    if not jobs:
+        console.print("No scheduled jobs.")
+        return
+    
+    table = Table(title="Scheduled Jobs")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name")
+    table.add_column("Schedule")
+    table.add_column("Status")
+    table.add_column("Next Run")
+    
+    import time
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    for job in jobs:
+        # Format schedule
+        if job.schedule.kind == "every":
+            sched = f"every {(job.schedule.every_ms or 0) // 1000}s"
+        elif job.schedule.kind == "cron":
+            sched = f"{job.schedule.expr or ''} ({job.schedule.tz})" if job.schedule.tz else (job.schedule.expr or "")
+        else:
+            sched = "one-time"
+        
+        # Format next run
+        next_run = ""
+        if job.state.next_run_at_ms:
+            ts = job.state.next_run_at_ms / 1000
+            try:
+                tz = ZoneInfo(job.schedule.tz) if job.schedule.tz else None
+                next_run = _dt.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                next_run = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))
+        
+        status = "[green]enabled[/green]" if job.enabled else "[dim]disabled[/dim]"
+        
+        table.add_row(job.id, job.name, sched, status, next_run)
+    
+    console.print(table)
+
+
+@cron_app.command("add")
+def cron_add(
+    name: str = typer.Option(..., "--name", "-n", help="Job name"),
+    message: str = typer.Option(..., "--message", "-m", help="Message for agent"),
+    every: int = typer.Option(None, "--every", "-e", help="Run every N seconds"),
+    cron_expr: str = typer.Option(None, "--cron", "-c", help="Cron expression (e.g. '0 9 * * *')"),
+    tz: str | None = typer.Option(None, "--tz", help="IANA timezone for cron (e.g. 'America/Vancouver')"),
+    at: str = typer.Option(None, "--at", help="Run once at time (ISO format)"),
+    deliver: bool = typer.Option(False, "--deliver", "-d", help="Deliver response to channel"),
+    to: str = typer.Option(None, "--to", help="Recipient for delivery"),
+    channel: str = typer.Option(None, "--channel", help="Channel for delivery (e.g. 'telegram', 'whatsapp')"),
+):
+    """Add a scheduled job."""
+    from nanobot.config.loader import get_data_dir
+    from nanobot.cron.service import CronService
+    from nanobot.cron.types import CronSchedule
+    
+    if tz and not cron_expr:
+        console.print("[red]Error: --tz can only be used with --cron[/red]")
+        raise typer.Exit(1)
+
+    # Determine schedule type
+    if every:
+        schedule = CronSchedule(kind="every", every_ms=every * 1000)
+    elif cron_expr:
+        schedule = CronSchedule(kind="cron", expr=cron_expr, tz=tz)
+    elif at:
+        import datetime
+        dt = datetime.datetime.fromisoformat(at)
+        schedule = CronSchedule(kind="at", at_ms=int(dt.timestamp() * 1000))
+    else:
+        console.print("[red]Error: Must specify --every, --cron, or --at[/red]")
+        raise typer.Exit(1)
+    
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+    
+    try:
+        job = service.add_job(
+            name=name,
+            schedule=schedule,
+            message=message,
+            deliver=deliver,
+            to=to,
+            channel=channel,
+        )
+    except ValueError as e:
+        console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(1) from e
+
+    console.print(f"[green]✓[/green] Added job '{job.name}' ({job.id})")
+
+
+@cron_app.command("remove")
+def cron_remove(
+    job_id: str = typer.Argument(..., help="Job ID to remove"),
+):
+    """Remove a scheduled job."""
+    from nanobot.config.loader import get_data_dir
+    from nanobot.cron.service import CronService
+    
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+    
+    if service.remove_job(job_id):
+        console.print(f"[green]✓[/green] Removed job {job_id}")
+    else:
+        console.print(f"[red]Job {job_id} not found[/red]")
+
+
+@cron_app.command("enable")
+def cron_enable(
+    job_id: str = typer.Argument(..., help="Job ID"),
+    disable: bool = typer.Option(False, "--disable", help="Disable instead of enable"),
+):
+    """Enable or disable a job."""
+    from nanobot.config.loader import get_data_dir
+    from nanobot.cron.service import CronService
+    
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+    
+    job = service.enable_job(job_id, enabled=not disable)
+    if job:
+        status = "disabled" if disable else "enabled"
+        console.print(f"[green]✓[/green] Job '{job.name}' {status}")
+    else:
+        console.print(f"[red]Job {job_id} not found[/red]")
+
+
+@cron_app.command("run")
+def cron_run(
+    job_id: str = typer.Argument(..., help="Job ID to run"),
+    force: bool = typer.Option(False, "--force", "-f", help="Run even if disabled"),
+):
+    """Manually run a job."""
+    from loguru import logger
+    from nanobot.config.loader import load_config, get_data_dir
+    from nanobot.cron.service import CronService
+    from nanobot.cron.types import CronJob
+    from nanobot.bus.queue import MessageBus
+    from nanobot.agent.loop import AgentLoop
+    logger.disable("nanobot")
+
+    config = load_config()
+    provider = _make_provider(config)
+    bus = MessageBus()
+    agent_loop = AgentLoop(
+        bus=bus,
+        provider=provider,
+        workspace=config.workspace_path,
+        model=config.agents.defaults.model,
+        temperature=config.agents.defaults.temperature,
+        max_tokens=config.agents.defaults.max_tokens,
+        max_iterations=config.agents.defaults.max_tool_iterations,
+        memory_window=config.agents.defaults.memory_window,
+        brave_api_key=config.tools.web.search.api_key or None,
+        exec_config=config.tools.exec,
+        restrict_to_workspace=config.tools.restrict_to_workspace,
+        mcp_servers=config.tools.mcp_servers,
+        channels_config=config.channels,
+    )
+
+    store_path = get_data_dir() / "cron" / "jobs.json"
+    service = CronService(store_path)
+
+    result_holder = []
+
+    async def on_job(job: CronJob) -> str | None:
+        response = await agent_loop.process_direct(
+            job.payload.message,
+            session_key=f"cron:{job.id}",
+            channel=job.payload.channel or "cli",
+            chat_id=job.payload.to or "direct",
+        )
+        result_holder.append(response)
+        return response
+
+    service.on_job = on_job
+
+    async def run():
+        return await service.run_job(job_id, force=force)
+
+    if asyncio.run(run()):
+        console.print("[green]✓[/green] Job executed")
+        if result_holder:
+            _print_agent_response(result_holder[0], render_markdown=True)
+    else:
+        console.print(f"[red]Failed to run job {job_id}[/red]")
 
 
 # ============================================================================

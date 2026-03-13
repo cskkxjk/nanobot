@@ -120,6 +120,13 @@ class ChannelManager:
                         continue
                     if not msg.metadata.get("_tool_hint") and not self.config.channels.send_progress:
                         continue
+                    # 非 CLI 不展示进度（工具提示、中间内容），只发最终回复
+                    if msg.channel != "cli":
+                        continue
+
+                # 仅 CLI 展示思考、流式 token 与工具 summary（如 Read file...）；QQ/Discord 等只发最终回复
+                if msg.metadata.get("type") in ("text_delta", "reasoning_delta", "reasoning", "tool_summary") and msg.channel != "cli":
+                    continue
 
                 channel = self.channels.get(msg.channel)
                 if channel:

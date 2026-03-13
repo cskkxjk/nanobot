@@ -215,7 +215,7 @@ class ChannelsConfig(Base):
     """Configuration for chat channels."""
 
     send_progress: bool = True  # stream agent's text progress to the channel
-    send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
+    send_tool_hints: bool = False  # show tool use (icon + title) and hints; set False to hide
     whatsapp: WhatsAppConfig = Field(default_factory=WhatsAppConfig)
     telegram: TelegramConfig = Field(default_factory=TelegramConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
@@ -305,6 +305,8 @@ class GatewayConfig(Base):
     host: str = "0.0.0.0"
     port: int = 18790
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+    # Base URL of the dashboard (e.g. http://localhost:8765) for cron→dashboard push. Empty = disabled.
+    dashboard_url: str = ""
 
 
 class WebSearchConfig(Base):
@@ -353,10 +355,17 @@ class ToolsConfig(Base):
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
 
 
+class AuthConfig(Base):
+    """Experimental auth (txt file; may switch to DB later)."""
+
+    allowed_users_path: str = ""  # Empty = ~/.nanobot/allowed_users.txt
+
+
 class Config(BaseSettings):
     """Root configuration for nanobot."""
 
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
+    auth: AuthConfig = Field(default_factory=AuthConfig)
     channels: ChannelsConfig = Field(default_factory=ChannelsConfig)
     providers: ProvidersConfig = Field(default_factory=ProvidersConfig)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)

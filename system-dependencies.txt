@@ -1,0 +1,58 @@
+# System dependencies for nanobot skills (not installable via pip)
+# Install with the package manager for your OS. Python packages are in requirements.txt / pyproject.toml [skills].
+
+# ---------------------------------------------------------------------------
+# LibreOffice (soffice)
+# Used by: xlsx (formula recalc), pptx (pptx→PDF), docx (.doc→.docx, export PDF)
+# ---------------------------------------------------------------------------
+# Ubuntu / Debian:
+#   sudo apt update && sudo apt install -y libreoffice-core
+# Fedora:
+#   sudo dnf install -y libreoffice-core
+# macOS:
+#   brew install --cask libreoffice
+# Windows: download from https://www.libreoffice.org/
+
+# ---------------------------------------------------------------------------
+# Poppler (pdftoppm, pdftotext)
+# Used by: pdf (PDF→image for OCR), pptx/docx (thumbnail / doc→image)
+# ---------------------------------------------------------------------------
+# Ubuntu / Debian:
+#   sudo apt update && sudo apt install -y poppler-utils
+# Fedora:
+#   sudo dnf install -y poppler-utils
+# macOS:
+#   brew install poppler
+# Windows: use pdf2image with bundled poppler or install from https://github.com/oschwartz10612/poppler-windows/releases
+
+# ---------------------------------------------------------------------------
+# Tesseract OCR (optional, for scanned PDF text extraction)
+# Used by: pdf skill when extracting text from scanned PDFs
+# ---------------------------------------------------------------------------
+# Ubuntu / Debian:
+#   sudo apt update && sudo apt install -y tesseract-ocr tesseract-ocr-eng
+# Fedora:
+#   sudo dnf install -y tesseract tesseract-langpack-eng
+# macOS:
+#   brew install tesseract
+# Windows: https://github.com/UB-Mannheim/tesseract/wiki
+
+# ---------------------------------------------------------------------------
+# Playwright browsers (after: pip install playwright)
+# Used by: news, browser_visible skills (browser automation)
+# ---------------------------------------------------------------------------
+# Run once after installing the playwright Python package:
+#   playwright install
+# Or install only Chromium:
+#   playwright install chromium
+
+# ---------------------------------------------------------------------------
+# Optional
+# ---------------------------------------------------------------------------
+# git - improves redlining/diff output in xlsx/docx/pptx validation scripts
+#   Ubuntu/Debian: sudo apt install -y git
+#   macOS: xcode-select --install or brew install git
+#
+# pandoc - optional for docx text extraction with tracked changes
+#   Ubuntu/Debian: sudo apt install -y pandoc
+#   macOS: brew install pandoc

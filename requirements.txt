@@ -1,0 +1,14 @@
+# Python packages for skills (xlsx/pdf/pptx/docx/browser). Install after core: pip install -e . && pip install -r requirements.txt
+# System deps (LibreOffice, Poppler, Tesseract, playwright browsers): see system-dependencies.txt
+openpyxl>=3.1.0,<4.0.0
+pandas>=2.0.0,<3.0.0
+pypdf>=4.0.0,<5.0.0
+pdfplumber>=0.10.0,<1.0.0
+reportlab>=4.0.0,<5.0.0
+pdf2image>=1.16.0,<2.0.0
+pytesseract>=0.3.10,<1.0.0
+markitdown>=0.0.1
+Pillow>=10.0.0,<11.0.0
+defusedxml>=0.7.0,<1.0.0
+lxml>=5.0.0,<6.0.0
+playwright>=1.40.0,<2.0.0

@@ -161,8 +161,17 @@ class SessionManager:
             return None
 
     def save(self, session: Session) -> None:
-        """Save a session to disk."""
+        """Save a session to disk. Sets default title from first user message if missing."""
         path = self._get_session_path(session.key)
+        if not session.metadata.get("title"):
+            for m in session.messages:
+                if m.get("role") == "user":
+                    raw = m.get("content") or ""
+                    if isinstance(raw, str):
+                        title = raw.replace("\n", " ").strip()[:50]
+                        if title:
+                            session.metadata["title"] = title
+                    break
 
         with open(path, "w", encoding="utf-8") as f:
             metadata_line = {
@@ -201,8 +210,11 @@ class SessionManager:
                         data = json.loads(first_line)
                         if data.get("_type") == "metadata":
                             key = data.get("key") or path.stem.replace("_", ":", 1)
+                            meta = data.get("metadata") or {}
+                            title = meta.get("title") or key
                             sessions.append({
                                 "key": key,
+                                "title": title,
                                 "created_at": data.get("created_at"),
                                 "updated_at": data.get("updated_at"),
                                 "path": str(path)

@@ -11,18 +11,36 @@ from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
+# Type for optional tool-summary callback: (tool_name, status, title?, description?, output?) -> None
+ToolSummaryCallback = Callable[
+    [str, str, str | None, str | None, str | None],
+    Awaitable[None],
+]
+# Type for optional thinking/reasoning callback
+ThinkingCallback = Callable[[str], Awaitable[None]]
+# Type for optional stream-delta callback (event_type, content)
+StreamDeltaCallback = Callable[[str, str], Awaitable[None]]
+
 from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.subagent import SubagentManager
+from nanobot.agent.title import generate_session_title
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.memory_search import MemorySearchTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.agent.tools.search import GlobSearchTool, GrepSearchTool
+from nanobot.agent.tools.send_file import SendFileTool
 from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
+from nanobot.agent.tools.task import TaskTool
+from nanobot.agent.tools.time import GetCurrentTimeTool
+from nanobot.agent.tools.todo import TodoReadTool, TodoWriteTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
+from nanobot.session.todo import TodoStore
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.providers.base import LLMProvider
@@ -82,6 +100,7 @@ class AgentLoop:
         self.context = ContextBuilder(workspace)
         self.sessions = session_manager or SessionManager(workspace)
         self.tools = ToolRegistry()
+        self._todo_store = TodoStore(workspace)
         self.subagents = SubagentManager(
             provider=provider,
             workspace=workspace,
@@ -116,6 +135,11 @@ class AgentLoop:
         allowed_dir = self.workspace if self.restrict_to_workspace else None
         for cls in (ReadFileTool, WriteFileTool, EditFileTool, ListDirTool):
             self.tools.register(cls(workspace=self.workspace, allowed_dir=allowed_dir))
+        self.tools.register(GrepSearchTool(workspace=self.workspace, allowed_dir=allowed_dir))
+        self.tools.register(GlobSearchTool(workspace=self.workspace, allowed_dir=allowed_dir))
+        self.tools.register(GetCurrentTimeTool())
+        self.tools.register(MemorySearchTool(workspace=self.workspace))
+        self.tools.register(SendFileTool(send_callback=self.bus.publish_outbound, workspace=self.workspace, allowed_dir=allowed_dir))
         self.tools.register(ExecTool(
             working_dir=str(self.workspace),
             timeout=self.exec_config.timeout,
@@ -153,7 +177,7 @@ class AgentLoop:
 
     def _set_tool_context(self, channel: str, chat_id: str, message_id: str | None = None) -> None:
         """Update context for all tools that need routing info."""
-        for name in ("message", "spawn", "cron"):
+        for name in ("message", "send_file", "spawn", "cron", "task", "todowrite", "todoread"):
             if tool := self.tools.get(name):
                 if hasattr(tool, "set_context"):
                     tool.set_context(channel, chat_id, *([message_id] if name == "message" else []))
@@ -176,16 +200,61 @@ class AgentLoop:
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _tool_summary_title(tool_name: str, arguments: dict[str, Any]) -> tuple[str, str | None]:
+        """Build a short title and optional description for CLI tool summary (OpenCode-style)."""
+        args = arguments or {}
+        # Prefer key order: path, command, query, url, etc.
+        path = args.get("path") or args.get("file_path")
+        cmd = args.get("command")
+        query = args.get("query")
+        url = args.get("url")
+        name = args.get("name")
+        if tool_name == "read_file" and path:
+            return f"Read {path}", None
+        if tool_name == "write_file" and path:
+            return f"Write {path}", None
+        if tool_name == "edit_file" and path:
+            return f"Edit {path}", None
+        if tool_name == "list_dir":
+            return f"List {path or '.'}", None
+        if tool_name == "exec" and cmd:
+            short = cmd.strip()[:60] + "…" if len(cmd.strip()) > 60 else cmd.strip()
+            return short, None
+        if tool_name == "web_search" and query:
+            return f'Web Search "{query[:50]}…"' if len(query) > 50 else f'Web Search "{query}"', None
+        if tool_name == "web_fetch" and url:
+            return f"WebFetch {url[:50]}…" if len(url) > 50 else f"WebFetch {url}", None
+        if tool_name == "message":
+            return "Message", None
+        if tool_name == "spawn":
+            return name or "Spawn", None
+        if tool_name == "task":
+            desc = args.get("description") or "Task"
+            return desc, None
+        if tool_name == "todowrite":
+            return "Todos", None
+        if tool_name == "todoread":
+            return "Read todos", None
+        if tool_name.startswith("mcp_"):
+            return tool_name.replace("mcp_", "", 1).replace("_", " ").title(), None
+        return tool_name.replace("_", " ").title(), None
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        on_tool_summary: ToolSummaryCallback | None = None,
+        on_thinking: ThinkingCallback | None = None,
+        on_stream_delta: StreamDeltaCallback | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        consecutive_tool_errors = 0
+        tool_defs = self.tools.get_definitions()
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -199,6 +268,8 @@ class AgentLoop:
             )
 
             if response.has_tool_calls:
+                if on_thinking and response.reasoning_content and response.reasoning_content.strip():
+                    await on_thinking(response.reasoning_content.strip())
                 if on_progress:
                     thought = self._strip_think(response.content)
                     if thought:
@@ -217,12 +288,36 @@ class AgentLoop:
 
                 for tool_call in response.tool_calls:
                     tools_used.append(tool_call.name)
+                    title, description = self._tool_summary_title(tool_call.name, tool_call.arguments)
+                    if on_tool_summary:
+                        await on_tool_summary(tool_call.name, "running", title, description, None)
                     args_str = json.dumps(tool_call.arguments, ensure_ascii=False)
                     logger.info("Tool call: {}({})", tool_call.name, args_str[:200])
                     result = await self.tools.execute(tool_call.name, tool_call.arguments)
+                    is_error = isinstance(result, str) and (
+                        result.startswith("Error") or "(no output)" in result or "no output" in result.lower()
+                    )
+                    if is_error:
+                        consecutive_tool_errors += 1
+                    else:
+                        consecutive_tool_errors = 0
+                    status = "error" if is_error else "completed"
+                    if on_tool_summary:
+                        await on_tool_summary(tool_call.name, status, title, description, result)
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+                if consecutive_tool_errors >= self._CONSECUTIVE_TOOL_ERROR_MAX:
+                    logger.info(
+                        "Stopping after {} consecutive tool errors",
+                        consecutive_tool_errors,
+                    )
+                    final_content = (
+                        "I tried several approaches but couldn't complete your request "
+                        "(the service may be unavailable or the tools didn't return useful data). "
+                        "Please try again later or use another method (e.g. check the weather on your phone or in a browser)."
+                    )
+                    break
             else:
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can
@@ -340,6 +435,10 @@ class AgentLoop:
         msg: InboundMessage,
         session_key: str | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        *,
+        sse_on_thinking: ThinkingCallback | None = None,
+        sse_on_stream_delta: StreamDeltaCallback | None = None,
+        sse_on_tool_summary: ToolSummaryCallback | None = None,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -357,7 +456,7 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages)
-            self._save_turn(session, all_msgs, 1 + len(history))
+            title_set = self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
             return OutboundMessage(channel=channel, chat_id=chat_id,
@@ -426,14 +525,62 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
+        async def _on_tool_summary(
+            tool_name: str,
+            status: str,
+            title: str | None,
+            description: str | None,
+            output: str | None,
+        ) -> None:
+            meta: dict[str, Any] = {
+                "type": "tool_summary",
+                "tool_name": tool_name,
+                "status": status,
+                "title": title,
+                "description": description,
+                "output": output,
+            }
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=output or "",
+                metadata=meta,
+            ))
+            if sse_on_tool_summary:
+                await sse_on_tool_summary(tool_name, status, title, description, output)
+
+        async def _on_thinking(text: str) -> None:
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=text,
+                metadata={"type": "reasoning"},
+            ))
+            if sse_on_thinking:
+                await sse_on_thinking(text)
+
+        async def _on_stream_delta(event_type: str, content: str) -> None:
+            await self.bus.publish_outbound(OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=content,
+                metadata={"type": event_type},
+            ))
+            if sse_on_stream_delta:
+                await sse_on_stream_delta(event_type, content)
+
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages,
+            on_progress=on_progress or _bus_progress,
+            on_tool_summary=_on_tool_summary,
+            on_thinking=_on_thinking if msg.channel in ("cli", "dashboard") else None,
+            on_stream_delta=_on_stream_delta if msg.channel in ("cli", "dashboard") else None,
         )
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
 
-        self._save_turn(session, all_msgs, 1 + len(history))
+        title_set = self._save_turn(session, all_msgs, 1 + len(history), user_media_paths=msg.media or [])
         self.sessions.save(session)
         await self.memory_consolidator.maybe_consolidate_by_tokens(session)
 
@@ -447,9 +594,22 @@ class AgentLoop:
             metadata=msg.metadata or {},
         )
 
-    def _save_turn(self, session: Session, messages: list[dict], skip: int) -> None:
-        """Save new-turn messages into session, truncating large tool results."""
+    def _save_turn(
+        self,
+        session: Session,
+        messages: list[dict],
+        skip: int,
+        *,
+        user_media_paths: list[str] | None = None,
+    ) -> bool:
+        """Save new-turn messages into session, truncating large tool results.
+        Returns True if we set a temporary title from the first user message (caller may run LLM title generation).
+        """
         from datetime import datetime
+
+        _image_extensions = {".jpg", ".jpeg", ".png", ".gif", ".webp"}
+        user_root = self.workspace.parent
+
         for m in messages[skip:]:
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
@@ -481,6 +641,70 @@ class AgentLoop:
             entry.setdefault("timestamp", datetime.now().isoformat())
             session.messages.append(entry)
         session.updated_at = datetime.now()
+        title_set_from_first = False
+        if not session.metadata.get("title"):
+            for m in session.messages:
+                if m.get("role") == "user":
+                    raw = m.get("content")
+                    title = ""
+                    if isinstance(raw, str):
+                        title = raw.replace("\n", " ").strip()[:50]
+                    elif isinstance(raw, list):
+                        for part in raw:
+                            if isinstance(part, dict) and part.get("type") == "text":
+                                title = (part.get("text") or "").replace("\n", " ").strip()[:50]
+                                break
+                    if title:
+                        session.metadata["title"] = title
+                        title_set_from_first = True
+                    break
+        return title_set_from_first
+
+    def _first_user_content(self, session: Session) -> str:
+        """Extract first user message content as plain text for title generation."""
+        for m in session.messages:
+            if m.get("role") != "user":
+                continue
+            raw = m.get("content")
+            if isinstance(raw, str):
+                return raw.replace("\n", " ").strip()
+            if isinstance(raw, list):
+                for part in raw:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        return (part.get("text") or "").replace("\n", " ").strip()
+            return ""
+        return ""
+
+    def _first_assistant_content(self, session: Session) -> str:
+        """Extract first assistant message content as plain text for title generation."""
+        for m in session.messages:
+            if m.get("role") != "assistant":
+                continue
+            raw = m.get("content")
+            if isinstance(raw, str):
+                return raw.replace("\n", " ").strip()
+            if isinstance(raw, list):
+                for part in raw:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        return (part.get("text") or "").replace("\n", " ").strip()
+            return ""
+        return ""
+
+    async def _maybe_generate_title(self, session: Session) -> None:
+        """Generate session title via LLM from first conversation and update session; keep current title on failure."""
+        user_content = self._first_user_content(session)
+        if not user_content:
+            return
+        assistant_content = self._first_assistant_content(session)
+        title = await generate_session_title(
+            self.provider,
+            self.model,
+            user_content,
+            first_assistant_content=assistant_content or None,
+        )
+        if title:
+            session.metadata["title"] = title
+            self.sessions.save(session)
 
     async def process_direct(
         self,

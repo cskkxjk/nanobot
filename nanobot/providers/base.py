@@ -3,6 +3,7 @@
 import asyncio
 import json
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -110,7 +111,7 @@ class LLMProvider(ABC):
 
             if isinstance(content, str) and not content:
                 clean = dict(msg)
-                clean["content"] = None if (msg.get("role") == "assistant" and msg.get("tool_calls")) else "(empty)"
+                clean["content"] = "" if (msg.get("role") == "assistant" and msg.get("tool_calls")) else "(empty)"
                 result.append(clean)
                 continue
 
@@ -128,7 +129,7 @@ class LLMProvider(ABC):
                     if filtered:
                         clean["content"] = filtered
                     elif msg.get("role") == "assistant" and msg.get("tool_calls"):
-                        clean["content"] = None
+                        clean["content"] = ""
                     else:
                         clean["content"] = "(empty)"
                     result.append(clean)
@@ -268,3 +269,20 @@ class LLMProvider(ABC):
     def get_default_model(self) -> str:
         """Get the default model for this provider."""
         pass
+
+    def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+    ) -> AsyncIterator[dict[str, Any]] | None:
+        """
+        Optional: stream chat completion, yielding events then final response.
+
+        Each yielded dict has "type" one of: "text_delta", "reasoning_delta", "done".
+        For "done", the dict has "response": LLMResponse.
+        Return None to indicate streaming is not supported (loop will use chat()).
+        """
+        return None  # noqa: R501

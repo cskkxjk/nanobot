@@ -120,6 +120,11 @@ class QQChannel(BaseChannel):
             return
 
         try:
+            content = (msg.content or "").strip()
+            if not content:
+                # QQ API 304061: empty content is rejected
+                content = "(无回复)"
+
             msg_id = msg.metadata.get("message_id")
             self._msg_seq += 1
             msg_type = self._chat_type_cache.get(msg.chat_id, "c2c")
@@ -127,7 +132,7 @@ class QQChannel(BaseChannel):
                 await self._client.api.post_group_message(
                     group_openid=msg.chat_id,
                     msg_type=0,
-                    content=msg.content,
+                    content=content,
                     msg_id=msg_id,
                     msg_seq=self._msg_seq,
                 )
@@ -135,7 +140,7 @@ class QQChannel(BaseChannel):
                 await self._client.api.post_c2c_message(
                     openid=msg.chat_id,
                     msg_type=0,
-                    content=msg.content,
+                    content=content,
                     msg_id=msg_id,
                     msg_seq=self._msg_seq,
                 )

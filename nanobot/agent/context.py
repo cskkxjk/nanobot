@@ -145,11 +145,12 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         ]
 
     def _build_user_content(self, text: str, media: list[str] | None) -> str | list[dict[str, Any]]:
-        """Build user message content with optional base64-encoded images."""
+        """Build user message content with optional base64-encoded images and attached file paths."""
         if not media:
             return text
 
         images = []
+        non_image_paths = []
         for path in media:
             p = Path(path)
             if not p.is_file():

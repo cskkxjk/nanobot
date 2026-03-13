@@ -71,10 +71,53 @@ class CronService:
         self.store_path = store_path
         self.on_job = on_job
         self._store: CronStore | None = None
-        self._last_mtime: float = 0.0
+        self._store_mtime_ns: int | None = None
         self._timer_task: asyncio.Task | None = None
+        self._watch_task: asyncio.Task | None = None
         self._running = False
 
+    def _get_store_mtime_ns(self) -> int | None:
+        """Best-effort mtime (ns) for change detection."""
+        try:
+            if not self.store_path.exists():
+                return None
+            return self.store_path.stat().st_mtime_ns
+        except Exception:
+            return None
+
+    def _maybe_reload_store(self) -> bool:
+        """Reload store if it was modified on disk by another writer.
+
+        Returns True if a reload happened.
+        """
+        current = self._get_store_mtime_ns()
+        if self._store_mtime_ns is None:
+            # Initialize baseline; avoid treating first observation as a change.
+            self._store_mtime_ns = current
+            return False
+
+        if current is None:
+            # File removed or stat failed; reset baseline and reload store.
+            if current != self._store_mtime_ns:
+                self._store_mtime_ns = current
+                self._store = None
+                self._load_store()
+                self._recompute_next_runs()
+                self._save_store()
+                return True
+            return False
+
+        if current > self._store_mtime_ns:
+            # External modification detected.
+            self._store_mtime_ns = current
+            self._store = None
+            self._load_store()
+            self._recompute_next_runs()
+            self._save_store()
+            return True
+
+        return False
+    
     def _load_store(self) -> CronStore:
         """Load jobs from disk. Reloads automatically if file was modified externally."""
         if self._store and self.store_path.exists():
@@ -131,7 +174,6 @@ class CronService:
         """Save jobs to disk."""
         if not self._store:
             return
-
         self.store_path.parent.mkdir(parents=True, exist_ok=True)
 
         data = {
@@ -170,8 +212,33 @@ class CronService:
         }
 
         self.store_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        self._last_mtime = self.store_path.stat().st_mtime
+        # Update baseline mtime after our own write to prevent immediate reload loops.
+        self._store_mtime_ns = self._get_store_mtime_ns()
     
+    def _start_watch(self) -> None:
+        """Start a lightweight watcher to reload jobs.json changes.
+
+        This is required because when there are no jobs scheduled, no timer tick
+        will fire, so we must still detect external writes (e.g. dashboard chat add/remove)
+        and arm the timer.
+        """
+        if self._watch_task:
+            return
+
+        async def watch():
+            while self._running:
+                try:
+                    await asyncio.sleep(1.0)
+                    if self._maybe_reload_store():
+                        self._arm_timer()
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    # Best-effort watcher; ignore errors to avoid crashing cron loop.
+                    continue
+
+        self._watch_task = asyncio.create_task(watch())
+
     async def start(self) -> None:
         """Start the cron service."""
         self._running = True
@@ -179,6 +246,7 @@ class CronService:
         self._recompute_next_runs()
         self._save_store()
         self._arm_timer()
+        self._start_watch()
         logger.info("Cron service started with {} jobs", len(self._store.jobs if self._store else []))
 
     def stop(self) -> None:
@@ -187,7 +255,10 @@ class CronService:
         if self._timer_task:
             self._timer_task.cancel()
             self._timer_task = None
-
+        if self._watch_task:
+            self._watch_task.cancel()
+            self._watch_task = None
+    
     def _recompute_next_runs(self) -> None:
         """Recompute next run times for all enabled jobs."""
         if not self._store:
@@ -230,6 +301,11 @@ class CronService:
         if not self._store:
             return
 
+        # If jobs.json was edited externally (e.g. from dashboard chat), reload it
+        # so add/remove takes effect without restarting the service.
+        if self._maybe_reload_store() and not self._store:
+            return
+        
         now = _now_ms()
         due_jobs = [
             j for j in self._store.jobs

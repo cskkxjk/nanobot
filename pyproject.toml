@@ -46,9 +46,26 @@ dependencies = [
     "chardet>=3.0.2,<6.0.0",
     "openai>=2.8.0",
     "tiktoken>=0.12.0,<1.0.0",
+    "fastapi>=0.115.0,<1.0.0",
+    "uvicorn[standard]>=0.32.0,<1.0.0",
 ]
 
 [project.optional-dependencies]
+# Python packages for xlsx/pdf/pptx/docx/browser skills (see nanobot/skills/DEPENDENCIES.md)
+skills = [
+    "openpyxl>=3.1.0,<4.0.0",
+    "pandas>=2.0.0,<3.0.0",
+    "pypdf>=4.0.0,<5.0.0",
+    "pdfplumber>=0.10.0,<1.0.0",
+    "reportlab>=4.0.0,<5.0.0",
+    "pdf2image>=1.16.0,<2.0.0",
+    "pytesseract>=0.3.10,<1.0.0",
+    "markitdown>=0.0.1",
+    "Pillow>=10.0.0,<11.0.0",
+    "defusedxml>=0.7.0,<1.0.0",
+    "lxml>=5.0.0,<6.0.0",
+    "playwright>=1.40.0,<2.0.0",
+]
 wecom = [
     "wecom-aibot-sdk-python>=0.1.2",
 ]
