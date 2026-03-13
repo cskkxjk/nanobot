@@ -72,6 +72,7 @@ class CronService:
         self.on_job = on_job
         self._store: CronStore | None = None
         self._store_mtime_ns: int | None = None
+        self._last_mtime: float | None = None
         self._timer_task: asyncio.Task | None = None
         self._watch_task: asyncio.Task | None = None
         self._running = False
@@ -122,7 +123,9 @@ class CronService:
         """Load jobs from disk. Reloads automatically if file was modified externally."""
         if self._store and self.store_path.exists():
             mtime = self.store_path.stat().st_mtime
-            if mtime != self._last_mtime:
+            if self._last_mtime is None:
+                self._last_mtime = mtime
+            elif mtime != self._last_mtime:
                 logger.info("Cron: jobs.json modified externally, reloading")
                 self._store = None
         if self._store:
@@ -212,8 +215,13 @@ class CronService:
         }
 
         self.store_path.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
-        # Update baseline mtime after our own write to prevent immediate reload loops.
-        self._store_mtime_ns = self._get_store_mtime_ns()
+        # Update baseline mtimes after our own write to prevent immediate reload loops.
+        mtime_ns = self._get_store_mtime_ns()
+        self._store_mtime_ns = mtime_ns
+        try:
+            self._last_mtime = self.store_path.stat().st_mtime
+        except Exception:
+            self._last_mtime = None
     
     def _start_watch(self) -> None:
         """Start a lightweight watcher to reload jobs.json changes.

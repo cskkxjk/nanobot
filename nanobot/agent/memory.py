@@ -144,10 +144,37 @@ class MemoryStore:
                 tool_choice=forced,
             )
 
-            if response.finish_reason == "error" and _is_tool_choice_unsupported(
-                response.content
-            ):
-                logger.warning("Forced tool_choice unsupported, retrying with auto")
+            if response.finish_reason == "error":
+                # #region agent log (debug)
+                try:
+                    import time as _time
+                    _log_path = "/home/xujunkai/workspace/llm/nanobot/.cursor/debug-d43886.log"
+                    with open(_log_path, "a", encoding="utf-8") as _f:
+                        _f.write(
+                            json.dumps(
+                                {
+                                    "sessionId": "d43886",
+                                    "hypothesisId": "H_mem_error",
+                                    "location": "nanobot/agent/memory.py:consolidate",
+                                    "message": "Memory consolidation LLM error",
+                                    "data": {
+                                        "content": (response.content or "")[:500],
+                                        "toolChoiceUnsupported": _is_tool_choice_unsupported(response.content),
+                                    },
+                                    "timestamp": int(_time.time() * 1000),
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+                except Exception:
+                    pass
+                # #endregion agent log (debug)
+                # Many backends reject tool_choice={"type":"function",...}; retry with "auto" on any error.
+                logger.warning(
+                    "Memory consolidation LLM error, retrying with tool_choice=auto: %s",
+                    (response.content or "")[:150],
+                )
                 response = await provider.chat_with_retry(
                     messages=chat_messages,
                     tools=_SAVE_MEMORY_TOOL,

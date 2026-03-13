@@ -427,6 +427,40 @@ def _make_provider(config: Config):
     provider_name = config.get_provider_name(model)
     p = config.get_provider(model)
 
+    # #region agent log (debug)
+    try:
+        import json as _json
+        import time as _time
+
+        with open(
+            "/home/xujunkai/workspace/llm/nanobot/.cursor/debug-d43886.log",
+            "a",
+            encoding="utf-8",
+        ) as _f:
+            _f.write(
+                _json.dumps(
+                    {
+                        "sessionId": "d43886",
+                        "runId": "pre-fix",
+                        "hypothesisId": "H3",
+                        "location": "nanobot/cli/commands.py:_make_provider",
+                        "message": "Selecting provider",
+                        "data": {
+                            "model": model,
+                            "providerName": provider_name,
+                            "hasProviderConfig": p is not None,
+                            "hasApiKey": bool(getattr(p, "api_key", None)) if p else False,
+                        },
+                        "timestamp": int(_time.time() * 1000),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+    # #endregion agent log (debug)
+
     # OpenAI Codex (OAuth)
     if provider_name == "openai_codex" or model.startswith("openai-codex/"):
         provider = OpenAICodexProvider(default_model=model)
@@ -465,6 +499,14 @@ def _make_provider(config: Config):
             extra_headers=p.extra_headers if p else None,
             provider_name=provider_name,
         )
+
+    defaults = config.agents.defaults
+    provider.generation = GenerationSettings(
+        temperature=defaults.temperature,
+        max_tokens=defaults.max_tokens,
+        reasoning_effort=defaults.reasoning_effort,
+    )
+    return provider
 
 
 def _resolve_login_workspace(config: Config, workspace_arg: str) -> tuple[Path, Path]:
@@ -510,14 +552,6 @@ def _resolve_login_workspace(config: Config, workspace_arg: str) -> tuple[Path, 
         return root / "workspace", root / "cron" / "jobs.json"
     root = get_user_root(user_id)
     return root / "workspace", root / "cron" / "jobs.json"
-
-    defaults = config.agents.defaults
-    provider.generation = GenerationSettings(
-        temperature=defaults.temperature,
-        max_tokens=defaults.max_tokens,
-        reasoning_effort=defaults.reasoning_effort,
-    )
-    return provider
 
 
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
@@ -565,7 +599,7 @@ def gateway(
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
     from nanobot.channels.manager import ChannelManager
-    from nanobot.config.paths import get_cron_dir
+    from nanobot.config.loader import get_data_dir
     from nanobot.cron.service import CronService
     from nanobot.cron.types import CronJob
     from nanobot.heartbeat.service import HeartbeatService
@@ -579,10 +613,11 @@ def gateway(
     port = port if port is not None else config.gateway.port
 
     console.print(f"{__logo__} Starting nanobot gateway on port {port}...")
-    sync_workspace_templates(config.workspace_path)
+    workspace_path = config.workspace_path
+    sync_workspace_templates(workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
-    session_manager = SessionManager(config.workspace_path)
+    session_manager = SessionManager(workspace_path)
     
     # Create cron service first (callback set after agent creation)
     cron_store_path = get_data_dir() / "cron" / "jobs.json"
@@ -826,19 +861,21 @@ def agent(
 
     from nanobot.agent.loop import AgentLoop
     from nanobot.bus.queue import MessageBus
-    from nanobot.config.paths import get_cron_dir
+    from nanobot.config.paths import get_data_dir
     from nanobot.cron.service import CronService
 
     config = _load_runtime_config(config, workspace)
     _print_deprecated_memory_window_notice(config)
-    workspace_path, cron_store_path = _resolve_login_workspace(config, workspace)
+
+    # CLI agent always uses the global workspace (admin mode), without login.
+    workspace_path = config.workspace_path
+    cron_store_path = get_data_dir() / "cron" / "jobs.json"
     sync_workspace_templates(workspace_path)
 
     bus = MessageBus()
     provider = _make_provider(config)
 
     # Create cron service for tool usage (no callback needed for CLI unless running)
-    cron_store_path = get_data_dir() / "cron" / "jobs.json"
     cron = CronService(cron_store_path)
 
     if logs:
@@ -1450,11 +1487,10 @@ def cron_run(
         provider=provider,
         workspace=config.workspace_path,
         model=config.agents.defaults.model,
-        temperature=config.agents.defaults.temperature,
-        max_tokens=config.agents.defaults.max_tokens,
         max_iterations=config.agents.defaults.max_tool_iterations,
-        memory_window=config.agents.defaults.memory_window,
-        brave_api_key=config.tools.web.search.api_key or None,
+        context_window_tokens=config.agents.defaults.context_window_tokens,
+        web_search_config=config.tools.web.search,
+        web_proxy=config.tools.web.proxy or None,
         exec_config=config.tools.exec,
         restrict_to_workspace=config.tools.restrict_to_workspace,
         mcp_servers=config.tools.mcp_servers,

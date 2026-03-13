@@ -64,6 +64,7 @@ class AgentLoop:
     """
 
     _TOOL_RESULT_MAX_CHARS = 16_000
+    _CONSECUTIVE_TOOL_ERROR_MAX = 3
 
     def __init__(
         self,
@@ -324,6 +325,36 @@ class AgentLoop:
                 # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
                     logger.error("LLM returned error: {}", (clean or "")[:200])
+                    # #region agent log (debug)
+                    try:
+                        import json as _json
+                        import time as _time
+                        with open(
+                            "/home/xujunkai/workspace/llm/nanobot/.cursor/debug-d43886.log",
+                            "a",
+                            encoding="utf-8",
+                        ) as _f:
+                            _f.write(
+                                _json.dumps(
+                                    {
+                                        "sessionId": "d43886",
+                                        "hypothesisId": "H_llm_error",
+                                        "location": "nanobot/agent/loop.py:_run_agent_loop",
+                                        "message": "LLM returned finish_reason=error",
+                                        "data": {
+                                            "content": (response.content or "")[:500],
+                                            "contentFullLen": len(response.content or ""),
+                                            "iteration": iteration,
+                                        },
+                                        "timestamp": int(_time.time() * 1000),
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
+                            )
+                    except Exception:
+                        pass
+                    # #endregion agent log (debug)
                     final_content = clean or "Sorry, I encountered an error calling the AI model."
                     break
                 messages = self.context.add_assistant_message(

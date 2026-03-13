@@ -1,6 +1,7 @@
 """Configuration loading utilities."""
 
 import json
+import time
 from pathlib import Path
 
 from nanobot.config.schema import Config
@@ -21,6 +22,45 @@ def get_config_path() -> Path:
     if _current_config_path:
         return _current_config_path
     return Path.home() / ".nanobot" / "config.json"
+
+
+def get_data_dir() -> Path:
+    """Return the instance-level runtime data directory (config file directory).
+
+    Kept for backwards compatibility with older call sites.
+    """
+    data_dir = get_config_path().parent
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    # #region agent log (debug)
+    try:
+        import json as _json
+
+        with open(
+            "/home/xujunkai/workspace/llm/nanobot/.cursor/debug-d43886.log",
+            "a",
+            encoding="utf-8",
+        ) as _f:
+            _f.write(
+                _json.dumps(
+                    {
+                        "sessionId": "d43886",
+                        "runId": "pre-fix",
+                        "hypothesisId": "H1",
+                        "location": "nanobot/config/loader.py:get_data_dir",
+                        "message": "Resolved data dir",
+                        "data": {"dataDir": str(data_dir)},
+                        "timestamp": int(time.time() * 1000),
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+    # #endregion agent log (debug)
+
+    return data_dir
 
 
 def load_config(config_path: Path | None = None) -> Config:
